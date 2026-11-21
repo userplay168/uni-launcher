@@ -92,13 +92,37 @@ public final class AmapTrafficLightAdapter {
         if(incoming==null){skipBroadcast(intent,"广播没有可用的灯态");return;}
         // Prefer the richer, enum-verified yh batch (even one direction) over
         // concurrent standard data whose direction enum is unverified.
-        // A cruise empty array always clears; it cannot fall back to stale data.
+        // An empty batch only drops the protocol flag; the last frame stays
+        // valid until TTL — see the comment below.
         if("standard".equals(channel)&&"cruise".equals(protocol)&&lights.length()>0
                 &&receivedAt>=0&&SystemClock.elapsedRealtime()-receivedAt<TTL_MS){skipBroadcast(intent,"标准通道数据让位于正在生效的 cruise 批次");return;}
+        // 空批次不是「这个路口的信号没了」，而是「这一刻没带灯态」。高德在绿灯
+        // 结束、换路口时会先发一个空包，1~4 秒后才有新相位首包（11-22 实车日志
+        // 18:15:59 → 18:16:02、18:16:59 → 18:17:03 都是这样）。以前立刻清空，
+        // 卡片会在红灯首包到达前先闪成「等待路口信号」；`receivedAt=-1` 还会顺手
+        // 把 TTL 定时器撤掉，空窗多长就空多久。这里只记日志，显示交给 TTL 自然
+        // 过期（最长 5 秒），红灯首包一到就无缝接上。
+        if(incoming.length()==0){
+            // 只有巡航通道会发空批次（standard 解析恒为单条，见
+            // AmapTrafficLightProtocol.standard）。这里显式按通道分开，是为了把
+            // **导航通道的行为锁死在改动之前**，将来 standard 解析有变化也不会被牵连。
+            if("cruise".equals(channel)){
+                // cruise 批次结束：清掉协议标记，别挡住随后可能到来的 standard 数据；
+                // 灯态与 receivedAt 都不动，上一帧继续有效到 TTL。
+                protocol="";
+                traceCycle(channel,incoming);
+                return;
+            }
+            // 非巡航通道的空批次按老规矩：整轮清空、等下一包（导航侧行为不变）。
+            clear("waiting");
+            traceCycle(channel,incoming);
+            changed.run();
+            return;
+        }
         handler.removeCallbacks(expire);sequence++;
-        lights=incoming;protocol=channel;reason=lights.length()==0?"waiting":"live";
-        receivedAt=lights.length()==0?-1:SystemClock.elapsedRealtime();
-        if(receivedAt>=0)handler.postDelayed(expire,TTL_MS);
+        lights=incoming;protocol=channel;reason="live";
+        receivedAt=SystemClock.elapsedRealtime();
+        handler.postDelayed(expire,TTL_MS);
         traceCycle(channel,incoming);
         changed.run();
     }
